@@ -1,9 +1,18 @@
 from __future__ import annotations
 
-import os, io, re, json, zipfile, tempfile, datetime as dt
+import os
+import io
+import re
+import json
+import zipfile
+import tempfile
+import datetime as dt
 from typing import List, Dict
 
-import pytz, requests, boto3
+import pytz
+import requests
+import boto3
+from posixpath import join
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from webdav3.client import Client
@@ -11,7 +20,6 @@ from webdav3.exceptions import WebDavException
 
 from airflow import DAG
 from airflow.decorators import task
-from airflow.operators.python import get_current_context
 from airflow.models import Variable
 from airflow.hooks.base import BaseHook
 from airflow.providers.ssh.operators.ssh import SSHOperator
@@ -52,6 +60,10 @@ DEFAULT_SUBJECT_CHAT_MAP = {
     'г. Севастополь': '',
     'г. Санкт-Петербург': ''
 }
+
+# Пороговое значение, если файл меньше — качаем через память, если больше — пользуемся временным файлом на диске
+MEMORY_LIMIT_BYTES = 104857600 # 1024 * 1024 * 100 (100 МБ)
+
 # ===== Клиенты =====
 def get_webdav_client():
     connection = BaseHook.get_connection('nextcloud_webdav')
@@ -114,11 +126,11 @@ with DAG(
 
     @task
     def sync_nextcloud_to_minio() -> List[str]:
+        conn = BaseHook.get_connection('nextcloud_webdav')
         client = get_webdav_client()
         s3 = get_s3()
 
-        base_dir = WEBDAV_REMOTE_DIR if WEBDAV_REMOTE_DIR.endswith("/") else WEBDAV_REMOTE_DIR + "/"
-        names = client.list(base_dir)
+        names = client.list(WEBDAV_REMOTE_DIR)
 
         uploaded, skipped = [], []
 
@@ -126,7 +138,7 @@ with DAG(
             if name.endswith("/") or not name.lower().endswith(".csv"):
                 continue
 
-            remote_path = name if name.startswith(base_dir) else base_dir + name
+            remote_path = join(WEBDAV_REMOTE_DIR, name)
             filename = os.path.basename(remote_path)
             s3_key = f"{LANDING_PREFIX}/{filename}"
 
@@ -135,7 +147,8 @@ with DAG(
                 info = client.resource(remote_path).info() or {}
             except WebDavException:
                 # если из-за прав/символов не смогли — пробуем старым способом
-                info = {}
+                print(f"Не смог получить метаданные файла {remote_path}")
+                continue
 
             nc_size = int(info.get("size")) if info.get("size") is not None else None
             nc_etag = (info.get("etag") or "").strip('"')
@@ -158,23 +171,48 @@ with DAG(
                 if code not in ("404", "NoSuchKey", "NotFound"):
                     raise
 
-            # 3) Скачиваем и загружаем в MinIO с сохранением метаданных источника
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            tmp.close()
-            client.download_sync(remote_path=remote_path, local_path=tmp.name)
-            with open(tmp.name, "rb") as f:
-                s3.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=s3_key,
-                    Body=f,
-                    Metadata={
+            # 3) Скачиваем и загружаем в MinIO с сохранением метаданных источника            
+            use_memory = nc_size is not None and nc_size < MEMORY_LIMIT_BYTES
+            s3_metadata = {
                         "nc_path": remote_path,
                         "nc_size": str(nc_size or 0),
                         "nc_modified": nc_modified,
                         "nc_etag": nc_etag,
-                    },
+            }
+
+
+            if use_memory:
+                # Качаем через оперативную память
+                # Параметры соединения для скачивания через оперативную память:
+                BASE_URL = f"{conn.schema}://{conn.host}"
+                auth = (conn.login, conn.password)
+                download_url = f"{BASE_URL}/remote.php/dav/files/{conn.login}/{remote_path.lstrip('/')}"
+
+                response = requests.get(download_url, auth=auth, timeout=60.0)
+                response.raise_for_status()
+
+                s3.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key,
+                    Body=response.content,  # Передаем массив байт из памяти
+                    Metadata=s3_metadata
                 )
-            os.unlink(tmp.name)
+            else:
+                # Качаем через временный файл на жестком диске
+                tmp = tempfile.NamedTemporaryFile(delete=False)
+                tmp.close()
+                try:
+                    client.download_sync(remote_path=remote_path, local_path=tmp.name)
+                    with open(tmp.name, "rb") as f:
+                        s3.put_object(
+                            Bucket=S3_BUCKET,
+                            Key=s3_key,
+                            Body=f,
+                            Metadata=s3_metadata,
+                        )
+                finally:
+                    if os.path.exists(tmp.name):
+                        os.unlink(tmp.name)
             uploaded.append(s3_key)
 
         print(f"Uploaded: {len(uploaded)}, skipped: {len(skipped)}")
@@ -192,15 +230,11 @@ with DAG(
             f"'{CSV_SEP}' '{CSV_ENCODING}'"
         ),
         do_xcom_push=False,
-        cmd_timeout=600,
+        cmd_timeout=SSH_CMD_TIMEOUT,
 
     )
     @task
-    def check_friday():
-        # контекст ранa
-        ctx = get_current_context()
-        execution_date = ctx["execution_date"]
-        dag_run = ctx.get("dag_run")
+    def check_friday(logical_date, dag_run=None):
 
         # флаг: Variable I38_FORCE_SEND=1 или {"force_send": true} при ручном запуске
         force = Variable.get("I38_FORCE_SEND", default_var="0") == "1"
@@ -209,7 +243,7 @@ with DAG(
 
         if force:
             return True
-        if not is_friday(execution_date):
+        if not is_friday(logical_date):
             raise AirflowSkipException("Not Friday — skipping weekly export and telegram sending")
         return True
 
@@ -233,12 +267,8 @@ with DAG(
         try:
             mapping_json = Variable.get(SUBJECT_CHAT_MAP_VAR)
             subject_chat_map: Dict[str, int] = json.loads(mapping_json)
-        except Exception:
+        except (KeyError, json.JSONDecodeError):
             subject_chat_map = DEFAULT_SUBJECT_CHAT_MAP
-
-        if not subject_chat_map:
-            print("SUBJECT_CHAT_MAP is empty — nothing to send.")
-            return
 
         s3 = get_s3()
         token = get_telegram_token()
@@ -247,6 +277,13 @@ with DAG(
 
         sent, skipped = [], []
         for subject, chat_id in subject_chat_map.items():
+
+            # Исключаем переход по пустым идентификаторам            
+            if not chat_id:
+                print(f"Пропускаем {subject}: получен пустой chat_id")
+                skipped.append(subject)
+                continue
+
             safe = make_slug(subject)
             key_prefix = f"{EXPORT_PREFIX}/{safe}.csv/"
 
