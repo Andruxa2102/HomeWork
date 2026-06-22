@@ -1,0 +1,37 @@
+# === Безопасность и Секреты ===
+.env
+.env.*
+!.env.example
+*.sql
+!sql/
+!sql/**/*.sql
+
+# === Окружение Python и Изоляция ===
+.venv/
+venv/
+ENV/
+env/
+pyvenv.cfg
+.python-version
+
+# === Кэш и компиляция Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# === Специфика IDE ===
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# === Локальные артефакты и кэш данных ===
+certs/
+saved_example/

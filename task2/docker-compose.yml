@@ -1,0 +1,20 @@
+services:
+  postgres_nsi:
+    image: postgres:14-alpine
+    container_name: postgres_nsi_test
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pg_nsi_data:/var/lib/postgresql/data
+
+volumes:
+  pg_nsi_data:
+
