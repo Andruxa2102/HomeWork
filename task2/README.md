@@ -6,6 +6,7 @@
 
 ## Архитектура проекта
 
+```text
 my_nsi_project/
 ├── pyproject.toml
 ├── README.md
@@ -27,7 +28,7 @@ my_nsi_project/
     ├── test_api_units.py                       # тест API-клиента
     ├── test_loader.py                          # общий тест loader.py
     └── test_version_logic.py                   # тест логики проверки версии
-
+```
 
 
 Дамп базы данных по состоянию после отработанного пайплайна находится по ссылке:
